@@ -1,0 +1,15 @@
+# System & Python
+__pycache__/
+*.pyc
+.DS_Store
+.env
+venv/
+
+# Project Artifacts (Files that are too big or generated)
+data/
+runs/
+experiments/
+models/
+figures/
+analysis/
+*.pt
