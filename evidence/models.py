@@ -57,7 +57,7 @@ class Small3DCNN(nn.Module):
     Lightweight 3D CNN for Voxel Grids.
     Structure: Conv3D -> BN -> Act -> MaxPool
     """
-    def __init__(self, input_channels=1, feature_dim=64): 
+    def __init__(self, input_channels=1, feature_dim=128): 
         super().__init__()
         base = 16 
         

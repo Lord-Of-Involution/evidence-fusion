@@ -4,6 +4,7 @@ import json
 import argparse
 import torch
 import torch.optim as optim
+import numpy as np
 from evidence.models import EvidenceMLP, Small3DCNN, FusionEvidenceNetwork
 from evidence.data import FusionDataset, get_balanced_loader
 from evidence.core import one_pop_exponential_loss, compute_posterior
@@ -22,7 +23,7 @@ def train_fusion(args):
         mlp_conf = json.load(f)
         
     mlp = EvidenceMLP(
-        input_size=mlp_conf["input_size"],
+        input_size=mlp_conf["input_dim"],  # <--- 修改为 input_dim
         hidden_sizes=mlp_conf["hidden_sizes"],
         dropout=mlp_conf["dropout"]
     )
@@ -32,7 +33,7 @@ def train_fusion(args):
     # ==========================================================================
     # 2. Build Fusion Model
     # ==========================================================================
-    cnn = Small3DCNN(input_channels=1, feature_dim=64)
+    cnn = Small3DCNN(input_channels=1, feature_dim=128)
     
     # This automatically Freezes MLP and applies Smart Init
     model = FusionEvidenceNetwork(mlp, cnn).to(device)

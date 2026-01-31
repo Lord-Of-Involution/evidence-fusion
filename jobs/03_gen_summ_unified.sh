@@ -2,8 +2,8 @@
 #SBATCH --job-name=jdong_gen_full
 #SBATCH --array=0-999
 #SBATCH --nodes=1
-#SBATCH --ntasks=32
-#SBATCH --time=06:00:00
+#SBATCH --ntasks=64             # <--- Kept your update (64 cores)
+#SBATCH --time=06:00:00         # <--- Kept your update (6 hours)
 #SBATCH --partition=shared
 #SBATCH --account=phy240043
 #SBATCH --output=/anvil/scratch/x-jdong8/jobout/%x_%A_%a.out
@@ -21,10 +21,10 @@ MODE="unbiased"
 
 if [[ "$MODE" == "unbiased" ]]; then
     SIM_NAME="fastpm_hodz"
-    echo " Running in UNBIASED mode (Class 0)"
+    echo "🔵 Running in UNBIASED mode (Class 0)"
 elif [[ "$MODE" == "biased" ]]; then
     SIM_NAME="fastpm_hodzbias"
-    echo "Running in BIASED mode (Class 1)"
+    echo "🔴 Running in BIASED mode (Class 1)"
 else
     echo "[FATAL] Unknown MODE: $MODE"; exit 1
 fi
@@ -36,6 +36,7 @@ module load conda
 conda activate cmass
 module load gsl
 
+# Set thread count based on ntasks (64 in your case)
 export OMP_NUM_THREADS=${SLURM_NTASKS:-1}
 export OPENBLAS_NUM_THREADS=${SLURM_NTASKS:-1}
 export MKL_NUM_THREADS=${SLURM_NTASKS:-1}
@@ -57,21 +58,21 @@ fi
 
 # Base Directory
 WDIR="/anvil/scratch/x-jdong8/cmass-ili"
-
-# Input Halo Path (Shared source)
+# Input Halo Path
 HALO_SRC_ROOT="/anvil/scratch/x-mho1/cmass-ili/abacuslike/fastpm/L2000-N256"
-
-# Output Directory (Changes based on SIM_NAME to avoid conflicts)
+# Output Directory
 OUTDIR="${WDIR}/abacuslike/${SIM_NAME}/L2000-N256"
 
-# Hydra Lock File (Prevents log race conditions)
+# Hydra Lock File
 mkdir -p "${WDIR}/logs"
 LOCK="${WDIR}/logs/hydra_logs.lock"
+# Failure Log File
+FAIL_LOG="${WDIR}/logs/failed_seeds.log"
 
 cd "$SRCDIR" || { echo "[FATAL] cannot cd to $SRCDIR"; exit 2; }
 
 # ==============================================================================
-# 2. Main Loop
+# 2. Main Loop (With Fault Tolerance)
 # ==============================================================================
 # Offset Control: Set to 0 for 0-999; Set to 1000 for 1000-1999
 OFFSET=0
@@ -80,10 +81,12 @@ OFFSET=0
 lhid=$((SLURM_ARRAY_TASK_ID + OFFSET))
 echo "================ LHID=${lhid} (Sim: ${SIM_NAME}) ================"
 
-# Base Hydra parameters
 POSTFIX_BASE="nbody=abacuslike sim=${SIM_NAME} nbody.N=256 nbody.lhid=${lhid}"
 
-# Run 20 HOD seeds per LHID
+# --- CRITICAL: Temporarily disable "Exit on Error" ---
+# This prevents a single failed seed (OOM/Crash) from killing the whole job.
+set +e
+
 for j in {0..19}; do
   hod_seed=$(( lhid*10 + j ))
   printf -v hod_str "%05d" "${hod_seed}"
@@ -91,11 +94,11 @@ for j in {0..19}; do
   lc_dir="${OUTDIR}/${lhid}/mtng_lightcone"
   lc_file="${lc_dir}/hod${hod_str}_aug00000.h5"
   
-  # --- Step A: Generate Lightcone (if not exists) ---
+  # --- Step A: Generate Lightcone ---
   if [[ -f "$lc_file" ]]; then
     echo "  [skip lc]   seed=${hod_seed} exists"
   else
-    # Symlink Halo File (Critical requirement for hodlightcone)
+    # Symlink Halo File
     halo_src="${HALO_SRC_ROOT}/${lhid}/halos.h5"
     halo_link="${OUTDIR}/${lhid}/halos.h5"
     mkdir -p "${OUTDIR}/${lhid}"
@@ -107,7 +110,8 @@ for j in {0..19}; do
     ln -sfn "$halo_src" "$halo_link"
 
     echo "  [run lc]    seed=${hod_seed} mode=${MODE}"
-    # Replicates parameters from your original run_hodz script
+    
+    # Run Python and capture the exit code (don't crash script)
     python -m cmass.survey.hodlightcone \
       $POSTFIX_BASE \
       bias.hod.seed=$hod_seed \
@@ -115,32 +119,50 @@ for j in {0..19}; do
       bias.hod.vel_assem_bias=false \
       survey.geometry=mtng survey.nomask=true \
       meta.wdir=$WDIR
+      
+    RET_CODE=$?
+    
+    # Check if failed (e.g. Memory Error, OOM Kill, or other crash)
+    if [ $RET_CODE -ne 0 ]; then
+        echo "  [FAIL] Lightcone gen failed for seed=${hod_seed} (Exit Code: $RET_CODE)"
+        echo "         -> Skipping this seed."
+        # Log the failure for later analysis
+        echo "${lhid},${hod_seed},LC_FAIL_${RET_CODE}" >> "$FAIL_LOG"
+        continue
+    fi
   fi
 
-  # --- Step B: Run Summary (summ) ---
+  # --- Step B: Run Summary ---
   if [[ ! -f "$lc_file" ]]; then
-    echo "  [err] Lightcone gen failed for seed ${hod_seed}"
+    echo "  [err] Lightcone gen failed (file missing), skipping summ..."
     continue
   fi
 
-  # Replicates parameters from your original summ_hodz script
-  # Note: survey.randoms=true is required for Pk measurements in summ.py
+  # Summary parameters (kept per your request)
   SUMM_CMD="python -m cmass.diagnostics.summ \
             $POSTFIX_BASE \
             bias.hod.seed=${hod_seed} \
             meta.wdir=${WDIR} \
             diag.survey_backend=pylians \
-            survey.randoms=true"
+            survey.randoms=true \
+            diag.from_scratch=false \
+            diag.mtng=true \
+            diag.galaxy=false \
+            diag.halo=false \
+            diag.summaries=\"['Pk','Bk']\""  
 
   echo "  [run summ]  seed=${hod_seed}"
   
-  # Run with file lock to prevent Hydra logging conflicts
+  # Use flock to prevent Hydra logging race conditions
   if ! flock -x "${LOCK}" -c "$SUMM_CMD"; then
-      echo "  [warn] flock contention, retrying..."
-      sleep 2
-      flock -x "${LOCK}" -c "$SUMM_CMD"
+      echo "  [FAIL] Summary failed for seed=${hod_seed}"
+      echo "${lhid},${hod_seed},SUMM_FAIL" >> "$FAIL_LOG"
+      continue
   fi
   
 done
+
+# --- Re-enable "Exit on Error" (Safety) ---
+set -e
 
 echo "[DONE] Task ${SLURM_ARRAY_TASK_ID} finished."

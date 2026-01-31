@@ -28,7 +28,7 @@ echo "[Step 1] Prepping Vectors..."
 python scripts/1_prep_vectors.py \
     --dir_0 "$RAW_DIR_0" \
     --dir_1 "$RAW_DIR_1" \
-    --out_dir "./data/vectors"
+    --out_dir "/anvil/scratch/x-jdong8/fusion_data/vectors"
 
 # 2. Prep Grids (IO Heavy)
 echo "------------------------------------------------"
@@ -36,7 +36,7 @@ echo "[Step 2] Prepping Grids..."
 python scripts/2_prep_grids.py \
     --dir_0 "$RAW_DIR_0" \
     --dir_1 "$RAW_DIR_1" \
-    --vector_dir "./data/vectors" \
-    --out_dir "./data/grids"
+    --vector_dir "/anvil/scratch/x-jdong8/fusion_data/vectors" \
+    --out_dir "/anvil/scratch/x-jdong8/fusion_data/grids"
 
 echo "Data Prep Complete!"

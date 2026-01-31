@@ -131,7 +131,7 @@ def train(args):
     config["input_dim"] = input_dim
     config["batchnorm"] = True # Explicitly record this!
     
-    with open(os.path.join(args.out_dir, "config.json"), "w") as f:
+    with open(os.path.join(args.out_dir, "mlp_config.json"), "w") as f:
         json.dump(config, f, indent=4)
 
     best_val_loss = math.inf
