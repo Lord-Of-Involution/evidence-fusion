@@ -79,7 +79,7 @@ class FusionDataset(Dataset):
 # ==============================================================================
 # 3. Helper: Balanced Loader
 # ==============================================================================
-def get_balanced_loader(dataset, batch_size, num_workers=0):
+def get_balanced_loader(dataset, batch_size, num_workers=0, **kwargs):
     """
     Creates a DataLoader with WeightedRandomSampler.
     This ensures each batch has roughly 50/50 class distribution,
@@ -117,7 +117,8 @@ def get_balanced_loader(dataset, batch_size, num_workers=0):
         batch_size=batch_size, 
         sampler=sampler, 
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=True,
+        **kwargs
     )
     
     print(f"Created Balanced Loader. Class Counts: {class_counts} -> Weights: {class_weights}")

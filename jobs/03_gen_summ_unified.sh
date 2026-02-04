@@ -16,8 +16,8 @@ set -euo pipefail
 # ==============================================================================
 
 # Mode Selection: "unbiased" (Class 0) or "biased" (Class 1)
-MODE="unbiased"
-# MODE="biased"  <-- Uncomment this line to run BIASED mode
+#MODE="unbiased"
+MODE="biased"  # Uncomment this line to run BIASED mode
 
 if [[ "$MODE" == "unbiased" ]]; then
     SIM_NAME="fastpm_hodz"
