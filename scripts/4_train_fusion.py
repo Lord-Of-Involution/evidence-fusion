@@ -125,4 +125,4 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=32) # Grids use more VRAM, lower batch size
     args = parser.parse_args()
     
-    train_fusion(args)
+    train_fusion(args) 

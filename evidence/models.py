@@ -118,7 +118,7 @@ class FusionEvidenceNetwork(nn.Module):
         joint_in = self.mlp.output_dim + self.cnn.output_dim
         self.joint_head = nn.Linear(joint_in, 1)
 
-        self._smart_init()
+        self._smart_init() 
 
     def _smart_init(self):
         """
