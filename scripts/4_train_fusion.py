@@ -20,20 +20,16 @@ def run_validation(model, loader, device, desc="Validation"):
     correct = 0
     total = 0
     
-    # Disable gradient calculation for speed and memory
     with torch.no_grad():
         pbar = tqdm(loader, desc=desc, leave=False)
-        # Correct unpacking for ((grid, vector), label) structure
         for (grid, vec), label in pbar:
             grid, vec, label = grid.to(device), vec.to(device), label.to(device)
             
             f_x = model(grid, vec)
             
-            # Sum up loss
             loss = one_pop_exponential_loss(f_x, label)
             val_loss += loss.item()
             
-            # Calculate accuracy
             post = compute_posterior(f_x)
             pred = (post > 0.5).float()
             correct += (pred == label).sum().item()
@@ -50,7 +46,7 @@ def train_fusion(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # 1. Load Pre-trained MLP (The Teacher)
+    # 1. Load MLP
     print(f"Loading MLP from {args.mlp_dir}...")
     with open(os.path.join(args.mlp_dir, "mlp_config.json"), "r") as f:
         mlp_conf = json.load(f)
@@ -71,33 +67,38 @@ def train_fusion(args):
         model = torch.nn.DataParallel(model)
     model.to(device)
     
-    # 3. Resume Logic & Auto-Baseline
+    # 3. Resume Logic
     best_loss = float('inf')
+    start_epoch = 0  # Track start epoch for resume
     
     if args.resume:
         print(f"\nResuming training from: {args.resume}")
         if os.path.isfile(args.resume):
             checkpoint = torch.load(args.resume, map_location=device)
             
-            # --- Handle 'module.' prefix mismatch ---
+            # --- Handle 'module.' prefix ---
             ckpt_keys = list(checkpoint.keys())
+            # Check if checkpoint is a full dict (with epoch/optimizer) or just state_dict
+            # For simplicity, we assume state_dict for now based on previous code, 
+            # but standard practice is saving {'epoch':..., 'state_dict':...}
+            # We will stick to state_dict only to match your previous format 
+            # to avoid breaking older checkpoints.
+            
+            state_dict = checkpoint
+            
             if ckpt_keys[0].startswith('module.') and not isinstance(model, torch.nn.DataParallel):
-                print("  Warning: Stripping 'module.' prefix for Single-GPU run...")
-                new_state_dict = {k.replace('module.', ''): v for k, v in checkpoint.items()}
-                checkpoint = new_state_dict
+                print("  Warning: Stripping 'module.' prefix...")
+                state_dict = {k.replace('module.', ''): v for k, v in checkpoint.items()}
             elif not ckpt_keys[0].startswith('module.') and isinstance(model, torch.nn.DataParallel):
-                print("  Warning: Adding 'module.' prefix for Multi-GPU run...")
-                new_state_dict = {'module.' + k: v for k, v in checkpoint.items()}
-                checkpoint = new_state_dict
-            # ----------------------------------------
-
-            model.load_state_dict(checkpoint)
+                print("  Warning: Adding 'module.' prefix...")
+                state_dict = {'module.' + k: v for k, v in checkpoint.items()}
+            
+            model.load_state_dict(state_dict)
             print("Checkpoint loaded successfully!")
         else:
             print(f"Error: Checkpoint file not found: {args.resume}")
             sys.exit(1)
 
-    # Only optimize parameters that require gradients
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), 
                            lr=args.lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
@@ -116,16 +117,15 @@ def train_fusion(args):
     val_loader = torch.utils.data.DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=16, prefetch_factor=2)
     print(f"Fusion Data Ready. Train: {len(train_ds)}, Val: {len(val_ds)}")
 
-    # 5. Calculate Baseline if Resuming
+    # 5. Baseline Check
     if args.resume:
         print("\nCalculating baseline performance from loaded checkpoint...")
         baseline_loss, baseline_acc = run_validation(model, val_loader, device, desc="Baseline Check")
         best_loss = baseline_loss
         print(f"Resumed Model Baseline -> Loss: {baseline_loss:.4f} | Acc: {baseline_acc:.4f}")
-        print(f"New checkpoints will ONLY be saved if Val Loss < {best_loss:.4f}")
+        print(f"New 'best' checkpoints will only be saved if Val Loss < {best_loss:.4f}")
     else:
-        # If starting fresh, run a quick check for Smart Init
-        print("\nVerifying Smart Initialization (Quick check)...")
+        print("\nVerifying Smart Initialization...")
         model.eval()
         init_correct = 0; init_total = 0
         with torch.no_grad():
@@ -138,10 +138,6 @@ def train_fusion(args):
                 init_total += label.size(0)
         init_acc = init_correct / init_total
         print(f"Initial Accuracy check: {init_acc:.4f}")
-        if init_acc < 0.70:
-            print("Warning: Smart Init might have failed!")
-        else:
-            print("Smart Init Success!")
 
     # 6. Training Loop
     for epoch in range(args.epochs):
@@ -152,11 +148,10 @@ def train_fusion(args):
         for i, ((grid, vec), label) in enumerate(pbar):
             grid, vec, label = grid.to(device), vec.to(device), label.to(device)
             
-            # Safety Check (Epoch 0 only, skip if resuming)
             if epoch == 0 and i == 0 and not args.resume:
                 non_zero = (grid != 0).float().mean().item()
                 if non_zero < 1e-6:
-                    print("Error: Data is empty! Check prep script.")
+                    print("Error: Data is empty!")
                     sys.exit(1)
             
             optimizer.zero_grad()
@@ -164,10 +159,7 @@ def train_fusion(args):
             
             loss = one_pop_exponential_loss(f_x, label)
             loss.backward()
-            
-            # Gradient Clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
             optimizer.step()
             train_loss += loss.item()
             pbar.set_postfix({'loss': f"{loss.item():.4f}"})
@@ -176,18 +168,23 @@ def train_fusion(args):
         
         # --- Validation ---
         avg_val_loss, val_acc = run_validation(model, val_loader, device, desc=f"Val Ep {epoch}")
-        
         print(f"Fusion Ep {epoch} | Tr Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Acc: {val_acc:.4f}")
         
         scheduler.step(avg_val_loss)
         
-        # Robust Save Logic
+        # --- 👇👇👇 SAVE LAST (ALWAYS) 👇👇👇 ---
+        # This ensures we don't lose progress if the job times out
+        last_path = os.path.join(args.out_dir, "fusion_last.pt")
+        torch.save(model.state_dict(), last_path)
+        # ----------------------------------------
+
+        # --- SAVE BEST (CONDITIONAL) ---
         if avg_val_loss < best_loss:
-            print(f"  New Best! ({best_loss:.4f} -> {avg_val_loss:.4f}). Saving model...")
+            print(f"  New Best! ({best_loss:.4f} -> {avg_val_loss:.4f}). Saving best model...")
             best_loss = avg_val_loss
             torch.save(model.state_dict(), os.path.join(args.out_dir, "fusion_best.pt"))
         else:
-            print(f"  Result {avg_val_loss:.4f} >= Best {best_loss:.4f}. Skipping save.")
+            print(f"  Result {avg_val_loss:.4f} >= Best {best_loss:.4f}. Updated 'last.pt' but skipping 'best.pt'.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -201,6 +198,5 @@ if __name__ == "__main__":
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint")
     
     args = parser.parse_args()
-    
     os.makedirs(args.out_dir, exist_ok=True)
     train_fusion(args)

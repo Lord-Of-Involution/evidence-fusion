@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=jdong_gen_full
-#SBATCH --array=0-999
+#SBATCH --array=912-999
 #SBATCH --nodes=1
 #SBATCH --ntasks=64             # <--- Kept your update (64 cores)
 #SBATCH --time=06:00:00         # <--- Kept your update (6 hours)
