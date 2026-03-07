@@ -27,6 +27,9 @@ def run_validation(model, loader, device, desc="Validation"):
             
             f_x = model(grid, vec)
             
+            # Logit Clamping to prevent exponential explosion
+            f_x = torch.clamp(f_x, min=-10.0, max=10.0)
+            
             loss = one_pop_exponential_loss(f_x, label)
             val_loss += loss.item()
             
@@ -60,6 +63,11 @@ def train_fusion(args):
     
     # 2. Build Fusion Model
     cnn = Small3DCNN(input_channels=1, feature_dim=128)
+
+    print("Locking the Teacher: Freezing MLP parameters...")
+    for param in mlp.parameters():
+        param.requires_grad = False
+
     model = FusionEvidenceNetwork(mlp, cnn)
 
     if torch.cuda.device_count() > 1:
@@ -69,21 +77,13 @@ def train_fusion(args):
     
     # 3. Resume Logic
     best_loss = float('inf')
-    start_epoch = 0  # Track start epoch for resume
     
     if args.resume:
         print(f"\nResuming training from: {args.resume}")
         if os.path.isfile(args.resume):
             checkpoint = torch.load(args.resume, map_location=device)
             
-            # --- Handle 'module.' prefix ---
             ckpt_keys = list(checkpoint.keys())
-            # Check if checkpoint is a full dict (with epoch/optimizer) or just state_dict
-            # For simplicity, we assume state_dict for now based on previous code, 
-            # but standard practice is saving {'epoch':..., 'state_dict':...}
-            # We will stick to state_dict only to match your previous format 
-            # to avoid breaking older checkpoints.
-            
             state_dict = checkpoint
             
             if ckpt_keys[0].startswith('module.') and not isinstance(model, torch.nn.DataParallel):
@@ -144,7 +144,9 @@ def train_fusion(args):
         model.train()
         train_loss = 0.0
         
+        optimizer.zero_grad()
         pbar = tqdm(train_loader, desc=f"Ep {epoch}")
+        
         for i, ((grid, vec), label) in enumerate(pbar):
             grid, vec, label = grid.to(device), vec.to(device), label.to(device)
             
@@ -154,15 +156,26 @@ def train_fusion(args):
                     print("Error: Data is empty!")
                     sys.exit(1)
             
-            optimizer.zero_grad()
             f_x = model(grid, vec)
             
+            # Logit Clamping
+            f_x = torch.clamp(f_x, min=-10.0, max=10.0)
+            
             loss = one_pop_exponential_loss(f_x, label)
+            
+            # Normalize loss for gradient accumulation
+            loss = loss / args.accum_steps
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            train_loss += loss.item()
-            pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+            
+            # Perform optimization step every accum_steps
+            if ((i + 1) % args.accum_steps == 0) or ((i + 1) == len(train_loader)):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+                
+            # Multiply back to display actual batch loss in progress bar
+            train_loss += (loss.item() * args.accum_steps)
+            pbar.set_postfix({'loss': f"{(loss.item() * args.accum_steps):.4f}"})
             
         avg_train_loss = train_loss / len(train_loader)
         
@@ -172,13 +185,9 @@ def train_fusion(args):
         
         scheduler.step(avg_val_loss)
         
-        # --- 👇👇👇 SAVE LAST (ALWAYS) 👇👇👇 ---
-        # This ensures we don't lose progress if the job times out
         last_path = os.path.join(args.out_dir, "fusion_last.pt")
         torch.save(model.state_dict(), last_path)
-        # ----------------------------------------
 
-        # --- SAVE BEST (CONDITIONAL) ---
         if avg_val_loss < best_loss:
             print(f"  New Best! ({best_loss:.4f} -> {avg_val_loss:.4f}). Saving best model...")
             best_loss = avg_val_loss
@@ -194,7 +203,8 @@ if __name__ == "__main__":
     parser.add_argument("--out_dir", type=str, default="./models/fusion")
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch_size", type=int, default=16) 
+    parser.add_argument("--batch_size", type=int, default=8) 
+    parser.add_argument("--accum_steps", type=int, default=4) 
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint")
     
     args = parser.parse_args()
