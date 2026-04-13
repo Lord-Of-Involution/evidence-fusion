@@ -36,13 +36,15 @@ def main(args):
         vector_pt_path=os.path.join(args.vector_dir, "train_data.pt"),
         catalog_h5_path=os.path.join(args.catalog_dir, "train_catalogs.h5"),
         centers_pt_path=os.path.join(args.catalog_dir, "train_centers.pt"),
-        subbox_size=args.subbox_size
+        subbox_size=args.subbox_size,
+        num_subboxes=args.num_subboxes  
     )
     val_ds = QuijotePointCloudDataset(
         vector_pt_path=os.path.join(args.vector_dir, "val_data.pt"),
         catalog_h5_path=os.path.join(args.catalog_dir, "val_catalogs.h5"),
         centers_pt_path=os.path.join(args.catalog_dir, "val_centers.pt"),
-        subbox_size=args.subbox_size
+        subbox_size=args.subbox_size,
+        num_subboxes=args.num_subboxes 
     )
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False, num_workers=16, pin_memory=True)
@@ -82,5 +84,6 @@ if __name__ == "__main__":
     parser.add_argument("--out_dir", type=str, default="/work/hdd/bdne/jdong8/fusion_models/ultimate_fusion")
     parser.add_argument("--batch_size", type=int, default=128) 
     parser.add_argument("--subbox_size", type=float, default=50.0)
+    parser.add_argument("--num_subboxes", type=int, default=4, help="Must match training setup!") 
     args = parser.parse_args()
     main(args)

@@ -21,11 +21,16 @@ export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 
 echo "================================================================"
 echo ">>> [Phase 1] Synced Evidence Extraction (100% Alignment)..."
-python scripts/10_extract_sync.py
+python scripts/10_extract_sync.py \
+        --subbox_size 50.0 \
+        --num_subboxes 8
 
 echo "================================================================"
 echo ">>> [Phase 2] Light-speed Additive Bayesian Optimization..."
 python scripts/11_fast_fusion.py
+
+echo ">>> [Phase 3] Plotting Comparison & Fusion Geometry..."
+python scripts/12_plot_comparison.py
 
 echo "================================================================"
 echo ">>> ALL DONE! You just broke the physics limit."
