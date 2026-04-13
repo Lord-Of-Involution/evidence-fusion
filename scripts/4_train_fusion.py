@@ -3,13 +3,43 @@ import os
 import json
 import argparse
 import torch
+import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-from evidence.models import EvidenceMLP, Small3DCNN, FusionEvidenceNetwork
+from evidence.models import EvidenceMLP, Small3DCNN
 from evidence.data import FusionDataset, get_balanced_loader
 from evidence.core import one_pop_exponential_loss, compute_posterior
 from tqdm import tqdm
 import sys 
+
+class SmartFusionNetwork(nn.Module):
+    def __init__(self, mlp, cnn, cnn_feat_dim=128):
+        super().__init__()
+        self.mlp = mlp
+        self.cnn = cnn
+        
+        self.cnn_proj = nn.Linear(cnn_feat_dim, 1)
+        
+
+        nn.init.zeros_(self.cnn_proj.weight)
+        nn.init.zeros_(self.cnn_proj.bias)
+        
+
+        self.gamma = nn.Parameter(torch.zeros(1))
+        
+
+        self.mlp_temp = nn.Parameter(torch.tensor(2.0, dtype=torch.float32))
+
+    def forward(self, grid, vec):
+        with torch.no_grad():
+            f_mlp = self.mlp(vec)         # [Batch, 1]
+            
+        cnn_feat = self.cnn(grid)         # [Batch, 128]
+        f_cnn = self.cnn_proj(cnn_feat)   # [Batch, 1] 
+        
+
+        f_final = (f_mlp / self.mlp_temp) + (self.gamma * f_cnn)
+        return f_final
 
 # ==============================================================================
 # Helper Function: Run Validation
@@ -27,8 +57,7 @@ def run_validation(model, loader, device, desc="Validation"):
             
             f_x = model(grid, vec)
             
-            # Logit Clamping to prevent exponential explosion
-            f_x = torch.clamp(f_x, min=-10.0, max=10.0)
+            # 删掉了极其愚蠢的 torch.clamp！现在有 gamma=0 护体，不需要阉割梯度了！
             
             loss = one_pop_exponential_loss(f_x, label)
             val_loss += loss.item()
@@ -68,7 +97,8 @@ def train_fusion(args):
     for param in mlp.parameters():
         param.requires_grad = False
 
-    model = FusionEvidenceNetwork(mlp, cnn)
+    # 使用我们注入了秘密知识的 SmartFusionNetwork
+    model = SmartFusionNetwork(mlp, cnn)
 
     if torch.cuda.device_count() > 1:
         print(f"Detected {torch.cuda.device_count()} GPUs! Using DataParallel.")
@@ -82,15 +112,12 @@ def train_fusion(args):
         print(f"\nResuming training from: {args.resume}")
         if os.path.isfile(args.resume):
             checkpoint = torch.load(args.resume, map_location=device)
-            
             ckpt_keys = list(checkpoint.keys())
             state_dict = checkpoint
             
             if ckpt_keys[0].startswith('module.') and not isinstance(model, torch.nn.DataParallel):
-                print("  Warning: Stripping 'module.' prefix...")
                 state_dict = {k.replace('module.', ''): v for k, v in checkpoint.items()}
             elif not ckpt_keys[0].startswith('module.') and isinstance(model, torch.nn.DataParallel):
-                print("  Warning: Adding 'module.' prefix...")
                 state_dict = {'module.' + k: v for k, v in checkpoint.items()}
             
             model.load_state_dict(state_dict)
@@ -99,6 +126,7 @@ def train_fusion(args):
             print(f"Error: Checkpoint file not found: {args.resume}")
             sys.exit(1)
 
+    # 包含 gamma 和 mlp_temp 在内的所有 require_grad 参数
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), 
                            lr=args.lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
@@ -123,21 +151,11 @@ def train_fusion(args):
         baseline_loss, baseline_acc = run_validation(model, val_loader, device, desc="Baseline Check")
         best_loss = baseline_loss
         print(f"Resumed Model Baseline -> Loss: {baseline_loss:.4f} | Acc: {baseline_acc:.4f}")
-        print(f"New 'best' checkpoints will only be saved if Val Loss < {best_loss:.4f}")
     else:
-        print("\nVerifying Smart Initialization...")
-        model.eval()
-        init_correct = 0; init_total = 0
-        with torch.no_grad():
-            for i, ((grid, vec), label) in enumerate(val_loader):
-                if i > 50: break
-                grid, vec, label = grid.to(device), vec.to(device), label.to(device)
-                f_x = model(grid, vec)
-                pred = (compute_posterior(f_x) > 0.5).float()
-                init_correct += (pred == label).sum().item()
-                init_total += label.size(0)
-        init_acc = init_correct / init_total
-        print(f"Initial Accuracy check: {init_acc:.4f}")
+        print("\nVerifying Smart Initialization (Gamma=0 ensures fallback to MLP baseline)...")
+        baseline_loss, baseline_acc = run_validation(model, val_loader, device, desc="Init Check")
+        print(f"Initial Accuracy (Should match MLP alone): {baseline_acc:.4f} | Init Loss: {baseline_loss:.4f}")
+        best_loss = baseline_loss
 
     # 6. Training Loop
     for epoch in range(args.epochs):
@@ -150,17 +168,9 @@ def train_fusion(args):
         for i, ((grid, vec), label) in enumerate(pbar):
             grid, vec, label = grid.to(device), vec.to(device), label.to(device)
             
-            if epoch == 0 and i == 0 and not args.resume:
-                non_zero = (grid != 0).float().mean().item()
-                if non_zero < 1e-6:
-                    print("Error: Data is empty!")
-                    sys.exit(1)
-            
             f_x = model(grid, vec)
             
-            # Logit Clamping
-            f_x = torch.clamp(f_x, min=-10.0, max=10.0)
-            
+            # 删掉 Clamp，直接算 Loss
             loss = one_pop_exponential_loss(f_x, label)
             
             # Normalize loss for gradient accumulation
@@ -173,9 +183,18 @@ def train_fusion(args):
                 optimizer.step()
                 optimizer.zero_grad()
                 
-            # Multiply back to display actual batch loss in progress bar
             train_loss += (loss.item() * args.accum_steps)
-            pbar.set_postfix({'loss': f"{(loss.item() * args.accum_steps):.4f}"})
+            
+            # 获取秘密监控器：gamma 和 temp 的值
+            current_gamma = model.module.gamma.item() if isinstance(model, torch.nn.DataParallel) else model.gamma.item()
+            current_temp = model.module.mlp_temp.item() if isinstance(model, torch.nn.DataParallel) else model.mlp_temp.item()
+            
+            # 把诊断信息打在公屏上，这才是你判断网络有没有学到东西的唯一标准
+            pbar.set_postfix({
+                'loss': f"{(loss.item() * args.accum_steps):.4f}", 
+                'gamma': f"{current_gamma:.4f}",
+                'temp': f"{current_temp:.2f}"
+            })
             
         avg_train_loss = train_loss / len(train_loader)
         
@@ -193,7 +212,7 @@ def train_fusion(args):
             best_loss = avg_val_loss
             torch.save(model.state_dict(), os.path.join(args.out_dir, "fusion_best.pt"))
         else:
-            print(f"  Result {avg_val_loss:.4f} >= Best {best_loss:.4f}. Updated 'last.pt' but skipping 'best.pt'.")
+            print(f"  Result {avg_val_loss:.4f} >= Best {best_loss:.4f}. Updated 'last.pt'.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -201,7 +220,7 @@ if __name__ == "__main__":
     parser.add_argument("--grid_dir", type=str, default="./data/grids")
     parser.add_argument("--mlp_dir", type=str, required=True)
     parser.add_argument("--out_dir", type=str, default="./models/fusion")
-    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--lr", type=float, default=5e-5) # 学习率保持这样，让 gamma 慢慢爬
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch_size", type=int, default=8) 
     parser.add_argument("--accum_steps", type=int, default=4) 

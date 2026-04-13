@@ -32,5 +32,5 @@ python scripts/4_train_fusion.py \
     --epochs 30 \
     --batch_size 16 \
     --accum_steps 2 \
-    --lr 2e-5
+    --lr 8e-5
     # --resume "/anvil/scratch/x-jdong8/fusion_models/fusion/fusion_best.pt"

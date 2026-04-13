@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-[Diagnostic Step] Train CNN Solo (No MLP)
-=========================================
+[Diagnostic Step] Train CNN Solo with Loss Switch (Shape Fix)
+=============================================================
 Purpose: 
-1. Check if 128^3 grids contain extractable information.
-2. Debug input statistics (Range, Non-zero fraction).
-3. Establish a baseline for pure visual performance.
+Compare stable feature extraction (BCE) vs. Bayes Factor 
+estimation (I-POP) on 3D grid data.
 """
 
 import os
@@ -16,7 +15,6 @@ import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
 
-# Import your existing modules
 from evidence.models import Small3DCNN
 from evidence.data import FusionDataset, get_balanced_loader
 from evidence.core import one_pop_exponential_loss, compute_posterior
@@ -27,22 +25,14 @@ from evidence.core import one_pop_exponential_loss, compute_posterior
 class SoloCNN(nn.Module):
     def __init__(self, feature_dim=128):
         super().__init__()
-        # Load your definition from models.py
-        # Make sure models.py has the AdaptiveAvgPool fix we discussed!
         self.cnn = Small3DCNN(input_channels=1, feature_dim=feature_dim)
-        
-        # Simple Linear Head for Classification (Scalar Output)
         self.head = nn.Linear(feature_dim, 1) 
 
     def forward(self, x):
-        # --- CRITICAL: Log Transform ---
-        # N-body density can range from -1 to 1000+. 
-        # CNNs hate this. We squash it.
-        # log(x + 2) ensures inputs are positive and compressed.
-        #x = torch.log1p(x + 1.0) 
-        
-        features = self.cnn(x)
-        return self.head(features)
+        # 强制对数压缩：拯救方差
+        x_safe = torch.log1p(torch.relu(x + 1.0))
+        features = self.cnn(x_safe)
+        return self.head(features) # Output shape: [Batch, 1]
 
 # ==============================================================================
 # 2. Training Logic
@@ -50,11 +40,10 @@ class SoloCNN(nn.Module):
 def train_solo(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    print(f"Selected Loss Type: {args.loss_type.upper()}")
 
-    # --- Data Loading ---
     print(f"Loading Grids from {args.grid_dir}...")
     
-    # We reuse FusionDataset but we will ignore the 'vec' part in the loop
     train_ds = FusionDataset(
         vector_path=os.path.join(args.vector_dir, "train_data.pt"),
         grid_path=os.path.join(args.grid_dir, "train_grids.npy")
@@ -64,19 +53,25 @@ def train_solo(args):
         grid_path=os.path.join(args.grid_dir, "val_grids.npy")
     )
     
-    # Use robust num_workers
     train_loader = get_balanced_loader(train_ds, batch_size=args.batch_size, num_workers=16, prefetch_factor=2)
     val_loader = torch.utils.data.DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=16, prefetch_factor=2)
     
     print(f"Data Ready. Train: {len(train_ds)}, Val: {len(val_ds)}")
 
     # --- Model Setup ---
-    model = SoloCNN(feature_dim=128).to(device)
+    model = SoloCNN(feature_dim=128)
+    
+    if torch.cuda.device_count() > 1:
+        print(f"Detected {torch.cuda.device_count()} GPUs! Using DataParallel.")
+        model = nn.DataParallel(model)
+        
+    model = model.to(device)
     
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+    patience = 3 if args.loss_type == 'ipop' else 4
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=patience)
 
-    # --- Training Loop ---
+    bce_criterion = nn.BCEWithLogitsLoss() if args.loss_type == 'bce' else None
     best_loss = float('inf')
     
     for epoch in range(args.epochs):
@@ -87,24 +82,21 @@ def train_solo(args):
         pbar = tqdm(train_loader, desc=f"CNN Solo Ep {epoch}")
         
         for i, ((grid, _), label) in enumerate(pbar):
-            # Move to GPU
             grid, label = grid.to(device), label.to(device)
-            
-            # --- [DIAGNOSTIC] Check Data Stats on First Batch ---
-            if epoch == 0 and i == 0:
-                print(f"\n[DEBUG] Input Grid Stats:")
-                print(f"  Shape: {grid.shape}")
-                print(f"  Raw Min: {grid.min().item():.4f} | Max: {grid.max().item():.4f}")
-                print(f"  Raw Mean: {grid.mean().item():.4f} | Std: {grid.std().item():.4f}")
-                print(f"  Non-Zero Fraction: {(grid != 0).float().mean().item():.6f}")
-                print("  (Note: Log transform is applied inside model forward)\n")
-            # ----------------------------------------------------
 
             optimizer.zero_grad()
-            f_x = model(grid) # Only using Grid!
             
-            loss = one_pop_exponential_loss(f_x, label)
+
+            f_x = model(grid) 
+            
+
+            if args.loss_type == 'bce':
+                loss = bce_criterion(f_x, label.float().view_as(f_x))
+            else:
+                loss = one_pop_exponential_loss(f_x, label.view_as(f_x))
+            
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             
             train_loss += loss.item()
@@ -122,36 +114,45 @@ def train_solo(args):
         with torch.no_grad():
             for (grid, _), label in val_loader:
                 grid, label = grid.to(device), label.to(device)
-                f_x = model(grid)
+                f_x = model(grid) # 保持 [Batch, 1]
                 
-                loss = one_pop_exponential_loss(f_x, label)
-                val_loss += loss.item()
+                if args.loss_type == 'bce':
+                    loss = bce_criterion(f_x, label.float().view_as(f_x))
+                    val_loss += loss.item()
+                    pred = (f_x > 0.0).float()
+                else:
+                    loss = one_pop_exponential_loss(f_x, label.view_as(f_x))
+                    val_loss += loss.item()
+                    post = compute_posterior(f_x)
+                    pred = (post > 0.5).float()
                 
-                post = compute_posterior(f_x)
-                pred = (post > 0.5).float()
-                correct += (pred == label).sum().item()
+                # 对齐 pred 和 label 的形状再求准确率
+                correct += (pred.view_as(label) == label).sum().item()
                 total += label.size(0)
 
         avg_val_loss = val_loss / len(val_loader)
         acc = correct / total
         
-        print(f"CNN Solo Ep {epoch} | Tr Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Acc: {acc:.4f}")
+        print(f"CNN Solo ({args.loss_type.upper()}) Ep {epoch} | Tr Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Acc: {acc:.4f}")
         
         scheduler.step(avg_val_loss)
         
         if avg_val_loss < best_loss:
             best_loss = avg_val_loss
-            torch.save(model.state_dict(), os.path.join(args.out_dir, "cnn_solo_best.pt"))
+            state_to_save = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+            save_name = f"cnn_solo_{args.loss_type}_best.pt"
+            torch.save(state_to_save, os.path.join(args.out_dir, save_name))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--vector_dir", type=str, default="./data/vectors")
     parser.add_argument("--grid_dir", type=str, default="./data/grids")
     parser.add_argument("--out_dir", type=str, default="./models/cnn_solo")
-    parser.add_argument("--lr", type=float, default=1e-4) # Slightly higher LR for solo training
+    parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--epochs", type=int, default=30)
-    # Important: Default batch size for 128^3
     parser.add_argument("--batch_size", type=int, default=16) 
+    parser.add_argument("--loss_type", type=str, choices=['bce', 'ipop'], default='bce', 
+                        help="Choose loss function: 'bce' for robust feature extraction, 'ipop' for evidence estimation.")
     args = parser.parse_args()
     
     os.makedirs(args.out_dir, exist_ok=True)
