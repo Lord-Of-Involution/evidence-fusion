@@ -4,7 +4,7 @@ import numpy as np
 from torch_geometric.data import Data, Dataset
 
 class QuijotePointCloudDataset(Dataset):
-    def __init__(self, vector_pt_path, catalog_h5_path, centers_pt_path, subbox_size=50.0, num_subboxes=4):
+    def __init__(self, vector_pt_path, catalog_h5_path, centers_pt_path, subbox_size=60.0, num_subboxes=8):
         super().__init__()
         payload = torch.load(vector_pt_path, map_location='cpu', weights_only=False)
         self.labels = payload['labels']

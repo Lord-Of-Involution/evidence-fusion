@@ -1,11 +1,14 @@
+# 修改 evidence/gnn_models.py
+
 import torch
 import torch.nn as nn
 from torch_geometric.nn import MessagePassing, global_mean_pool, global_max_pool
 
-# ==============================================================================
-# 原生 Tensor Core 距离图，彻底抛弃 torch-cluster 编译黑洞
-# ==============================================================================
+from torch_geometric.utils import to_dense_batch
+
+@torch.no_grad()
 def native_radius_graph(pos, r, global_batch):
+
     edge_indices =[]
     unique_batches = torch.unique(global_batch)
     
@@ -13,7 +16,7 @@ def native_radius_graph(pos, r, global_batch):
         node_indices = torch.where(global_batch == b_idx)[0]
         pos_b = pos[node_indices]
         
-        # GPU 上光速完成 O(N^2) 距离矩阵
+        # 逐框计算距离矩阵，算完即毁，完美控制显存
         dist_mat = torch.cdist(pos_b, pos_b)
         
         # 半径内，且不是自环
@@ -30,17 +33,17 @@ def native_radius_graph(pos, r, global_batch):
         
     return torch.cat(edge_indices, dim=1)
 
-# ==============================================================================
-# Anisotropic GNN (保持两层，防止 Oversmoothing)
-# ==============================================================================
 class AnisotropicGNN(MessagePassing):
-    def __init__(self, in_channels, out_channels, r_link=10.0):
-        super().__init__(aggr='mean') 
+    # 【默认半径扩大到 20 Mpc】
+    def __init__(self, in_channels, out_channels, r_link=20.0):
+        # 【极其关键】将 aggr='mean' 改为 aggr='add'。
+        # 这样网络会自动对邻居的信息求和，完美等效于计算暗物质晕周围的“局部密度”！
+        super().__init__(aggr='add') 
         self.r_link = r_link
         
-        # 物理护城河：4 个几何特征并行输入
+        # 【物理升级：输入维度变为 5】
         self.edge_mlp = nn.Sequential(
-            nn.Linear(4, 32),
+            nn.Linear(5, 32),
             nn.GELU(),
             nn.Linear(32, out_channels)
         )
@@ -58,13 +61,16 @@ class AnisotropicGNN(MessagePassing):
         row, col = edge_index
         diff = pos[row] - pos[col]
         
+        # 【物理升级：加入带符号的相空间信息 signed_z】
+        signed_z = diff[:, 2] 
         r_parallel = torch.abs(diff[:, 2]) 
         r_perp = torch.sqrt(diff[:, 0]**2 + diff[:, 1]**2) 
         
         r_diff = torch.abs(r_parallel - r_perp)
         r_ratio = r_parallel / (r_perp + 1e-5)
         
-        edge_attr = torch.stack([r_parallel, r_perp, r_diff, r_ratio], dim=1)
+        # 5维无死角物理边特征
+        edge_attr = torch.stack([signed_z, r_parallel, r_perp, r_diff, r_ratio], dim=1)
         
         x = self.propagate(edge_index, x=x, edge_attr=edge_attr, size=(x.size(0), x.size(0)))
         return x
@@ -76,11 +82,9 @@ class AnisotropicGNN(MessagePassing):
         combined = torch.cat([x, aggr_out], dim=1)
         return self.node_mlp(combined)
 
-# ==============================================================================
-# Bayesian MIL Evidence GNN (全阶统计矩版本)
-# ==============================================================================
 class EvidenceGNN(nn.Module):
-    def __init__(self, r_link=10.0, hidden_dim=64):
+    # 默认 r_link 提升为 20.0
+    def __init__(self, r_link=20.0, hidden_dim=64):
         super().__init__()
         self.conv1 = AnisotropicGNN(in_channels=1, out_channels=hidden_dim, r_link=r_link)
         self.conv2 = AnisotropicGNN(in_channels=hidden_dim, out_channels=hidden_dim, r_link=r_link)
@@ -94,36 +98,34 @@ class EvidenceGNN(nn.Module):
             nn.Linear(64, 1) 
         )
         
-        # 【护城河：强制零初始化】
-        # 让网络出生的那一刻处于绝对无偏状态，Loss = exp(0) = 1.0，彻底告别 2 亿！
+        # 护城河：强制零初始化
         nn.init.zeros_(self.head[-1].weight)
         nn.init.zeros_(self.head[-1].bias)
+        
+        # 【防线补充】：加入 MIL Temperature 控制求和导致的爆炸
+        self.mil_temp = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, data):
         x, pos, batch, sub_batch = data.x, data.pos, data.batch, data.sub_batch
         M = sub_batch.max().item() + 1
         global_batch = batch * M + sub_batch
         
-        # 1. 两次物理感受野传导
         x = self.conv1(x, pos, global_batch)
         x = self.conv2(x, pos, global_batch)
         
-        # 2. 全阶物理统计矩提取
-        x_mean = global_mean_pool(x, global_batch)               # 均值
-        x_max = global_max_pool(x, global_batch)                 # 最大星系团核心
-        x_min = -global_max_pool(-x, global_batch)               # 空洞探测器
-        
-        # 【护城河：用 Variance 替代 Std】
-        # E[X^2] - E[X]^2，去掉 sqrt 防止导数在 0 处爆炸！
+        x_mean = global_mean_pool(x, global_batch)
+        x_max = global_max_pool(x, global_batch)
+        x_min = -global_max_pool(-x, global_batch)
         x_sq_mean = global_mean_pool(x**2, global_batch)
         x_var = torch.relu(x_sq_mean - x_mean**2) 
         
-        # 四神兽合体
         global_feat = torch.cat([x_mean, x_max, x_min, x_var], dim=1)
         
-        # 3. 贝叶斯证据池化
         local_evidences = self.head(global_feat)
         local_evidences = local_evidences.view(batch.max().item() + 1, M)
-        global_evidence = local_evidences.sum(dim=1, keepdim=True) 
+        
+        # 【物理升级】用 mean() 替代 sum()，并除以可学习的 Temperature，防止校准崩塌
+        safe_temp = torch.clamp(self.mil_temp, min=0.1)
+        global_evidence = local_evidences.mean(dim=1, keepdim=True) / safe_temp
         
         return global_evidence

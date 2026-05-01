@@ -4,7 +4,7 @@ import torch
 import os
 from tqdm import tqdm
 
-def precompute_centers(grid_npy, out_pt, M=4, num_candidates=50, subbox_size=50.0):
+def precompute_centers(grid_npy, out_pt, M=4, num_candidates=50, subbox_size=60.0):
     print(f"Opening {grid_npy} (Sequential Read)...")
     grids = np.load(grid_npy, mmap_mode='r')
     N = grids.shape[0]
@@ -46,7 +46,7 @@ if __name__ == "__main__":
     precompute_centers(
         f"{base_dir}/grids/train_grids.npy", 
         f"{base_dir}/catalogs/train_centers.pt", 
-        M=16, num_candidates=150
+        M=16, num_candidates=150, subbox_size=100.0
     )
     precompute_centers(
         f"{base_dir}/grids/val_grids.npy", 

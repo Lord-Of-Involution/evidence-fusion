@@ -7,10 +7,11 @@ import torch.optim as optim
 from torch.utils.data import Sampler
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
-
+import math
 from evidence.gnn_dataset import QuijotePointCloudDataset
 from evidence.gnn_models import EvidenceGNN
-from evidence.core import one_pop_exponential_loss, compute_posterior
+from evidence.core import one_pop_exponential_loss, compute_posterior, l_pop_transform
+
 
 class ChunkedRandomSampler(Sampler):
     def __init__(self, data_source, chunk_size=512):
@@ -64,7 +65,17 @@ def main(args):
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler, num_workers=16, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=16, pin_memory=True)
 
-    model = EvidenceGNN(r_link=10.0, hidden_dim=64).to(device)
+    # ======== 【贝叶斯先验偏置计算】 ========
+    # GNN 的 dataset 里有 self.labels，直接拿来用
+    n1 = train_ds.labels.sum().item()
+    n0 = len(train_ds.labels) - n1
+    c_prior = math.log(n1 / max(1, n0))
+    print("="*60)
+    print(f">>> GNN Dataset Stats: N0 = {n0}, N1 = {n1}")
+    print(f">>> Bayesian Prior Bias (c) = {c_prior:.6f}")
+    print("="*60)
+
+    model = EvidenceGNN(r_link=args.r_link, hidden_dim=args.hidden_dim).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-3)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
 
@@ -80,6 +91,25 @@ def main(args):
         best_loss = checkpoint['best_loss']
 
     for epoch in range(start_epoch, args.epochs):
+
+        if epoch == args.bce_epochs:
+            print("\n" + "="*60)
+            print(f">>> [Phase Shift] Switching from BCE to 1-POP Loss at Epoch {epoch}!")
+
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = param_group['lr'] * 0.1
+                
+            print(f">>> Dropped LR to {optimizer.param_groups[0]['lr']} for exponential landscape!")            
+            
+            print(">>> Resetting best_loss and LR Scheduler...")
+            print("="*60 + "\n")
+            best_loss = float('inf')
+            # 重新初始化 Scheduler，让他忘记 BCE 时期的极低 Loss！
+            # 注意 GNN 这里的 patience 是 3
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode='min', factor=0.5, patience=3
+            )
+
         model.train()
         train_loss = 0.0
         pbar = tqdm(train_loader, desc=f"Ep {epoch} Train")
@@ -87,12 +117,23 @@ def main(args):
             data = data.to(device)
             optimizer.zero_grad()
             f_x = model(data)
-            loss = one_pop_exponential_loss(f_x, data.y)
+            
+            # 【物理升级：Curriculum Learning】
+            if epoch < args.bce_epochs:
+                # 预热期：将 log-evidence 转回 Logits，跑 BCE
+                logits = l_pop_transform(f_x, alpha=2.0) + c_prior
+                loss = torch.nn.BCEWithLogitsLoss()(logits, data.y.float().view_as(logits))
+                desc_loss = "BCE"
+            else:
+                # 进阶期：切换为纯粹的 1-POP 贝叶斯精调
+                loss = one_pop_exponential_loss(f_x, data.y, c=c_prior)
+                desc_loss = "1POP"
+                
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             train_loss += loss.item()
-            pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+            pbar.set_postfix({'loss': f"{loss.item():.4f}", 'type': desc_loss})
 
         model.eval()
         val_loss = 0.0; correct = 0; total = 0
@@ -100,9 +141,15 @@ def main(args):
             for data in tqdm(val_loader, desc=f"Ep {epoch} Val", leave=False):
                 data = data.to(device)
                 f_x = model(data)
-                loss = one_pop_exponential_loss(f_x, data.y)
+
+                if epoch < args.bce_epochs:
+                    logits = l_pop_transform(f_x, alpha=2.0) + c_prior
+                    loss = torch.nn.BCEWithLogitsLoss()(logits, data.y.float().view_as(logits))
+                else:
+                    loss = one_pop_exponential_loss(f_x, data.y.view_as(f_x), alpha=2.0, c=c_prior)
+
                 val_loss += loss.item()
-                pred = (compute_posterior(f_x) > 0.5).float()
+                pred = (compute_posterior(f_x, alpha=2.0, c=c_prior) > 0.5).float()
                 correct += (pred.view(-1) == data.y.view(-1)).sum().item()
                 total += data.y.size(0)
 
@@ -142,12 +189,14 @@ if __name__ == "__main__":
     parser.add_argument("--vector_dir", type=str, default="/work/hdd/bdne/jdong8/fusion_data/vectors")
     parser.add_argument("--catalog_dir", type=str, default="/work/hdd/bdne/jdong8/fusion_data/catalogs")
     parser.add_argument("--out_dir", type=str, default="/work/hdd/bdne/jdong8/fusion_models/gnn_solo")
-    parser.add_argument("--epochs", type=int, default=40)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--bce_epochs", type=int, default=10, help="Number of epochs to train with BCE loss before switching to 1-POP")
     parser.add_argument("--batch_size", type=int, default=64) 
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--subbox_size", type=float, default=50.0)
-    # 【加回来了！】
-    parser.add_argument("--num_subboxes", type=int, default=4)
+    parser.add_argument("--subbox_size", type=float, default=60.0)
+    parser.add_argument("--num_subboxes", type=int, default=8)
+    parser.add_argument("--r_link", type=float, default=20.0, help="Graph linking radius")
+    parser.add_argument("--hidden_dim", type=int, default=64, help="GNN hidden channels")
     args = parser.parse_args()
     main(args)

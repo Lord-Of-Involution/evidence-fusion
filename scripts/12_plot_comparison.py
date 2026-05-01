@@ -53,7 +53,7 @@ def main(args):
 
     # 4. 转化为概率
     P_mlp = compute_probability(val_mlp).numpy().flatten()
-    P_gnn = compute_probability(val_gnn).numpy().flatten() # 顺便看看 GNN 单独的表现
+    P_gnn = compute_probability(val_gnn).numpy().flatten() 
     P_fus = compute_probability(f_fus).numpy().flatten()
     Y_np  = val_y.numpy().flatten()
 
@@ -67,24 +67,43 @@ def main(args):
     print(f"  MLP Solo Acc : {acc_mlp:.4f}")
     print(f"  Fusion Acc   : {acc_fus:.4f}")
 
-    # ==========================================
-    # 6. 开始画图
+    os.makedirs(args.out_dir, exist_ok=True)
+# ==========================================
+    # 5.5 新增图: MLP-Only Histogram (纯宏观频谱的证据分布 - 铺垫用)
     # ==========================================
     os.makedirs(args.out_dir, exist_ok=True)
-    print("\nGenerating Histogram Plot...")
+    print("\nGenerating MLP-Only Histogram Plot...")
     
     plt.figure(figsize=(10, 6), dpi=150)
-    
     mask0 = (Y_np == 0) # True Class 0 (Unbiased)
     mask1 = (Y_np == 1) # True Class 1 (Biased)
-    
     bins = np.linspace(0, 1, 50)
     
-    # 绘制 MLP 的阴影图
+    # 稍微调高了透明度 (alpha=0.5) 让单图看起来更饱满
+    plt.hist(P_mlp[mask0], bins=bins, density=True, alpha=0.5, color='blue', label='Spectra-MLP (True 0: Fiducial)')
+    plt.hist(P_mlp[mask1], bins=bins, density=True, alpha=0.5, color='orange', label='Spectra-MLP (True 1: Biased)')
+
+    plt.title(f"Macroscopic Spectra Evidence Distribution\nAccuracy: {acc_mlp:.3f}")
+    plt.xlabel("Probability $P(M_1 | x)$")
+    plt.ylabel("Density")
+    plt.legend(loc='upper center')
+    plt.grid(True, alpha=0.3)
+    
+    out_mlp_hist = os.path.join(args.out_dir, "mlp_only_hist.png")
+    plt.savefig(out_mlp_hist, bbox_inches='tight')
+    plt.close()
+    print(f"Saved MLP-Only Histogram to {out_mlp_hist}")
+    # ==========================================
+    # 6. 图 1: Histogram (直方图)
+    # ==========================================
+    print("\nGenerating Histogram Plot...")
+    plt.figure(figsize=(10, 6), dpi=150)
+    mask0 = (Y_np == 0) # True Class 0 (Unbiased)
+    mask1 = (Y_np == 1) # True Class 1 (Biased)
+    bins = np.linspace(0, 1, 50)
+    
     plt.hist(P_mlp[mask0], bins=bins, density=True, alpha=0.3, color='blue', label='MLP (True 0)')
     plt.hist(P_mlp[mask1], bins=bins, density=True, alpha=0.3, color='orange', label='MLP (True 1)')
-    
-    # 绘制 Fusion 的阶梯图
     plt.hist(P_fus[mask0], bins=bins, density=True, histtype='step', linewidth=2.5, color='darkblue', label='Fusion (True 0)')
     plt.hist(P_fus[mask1], bins=bins, density=True, histtype='step', linewidth=2.5, color='darkorange', label='Fusion (True 1)')
 
@@ -93,76 +112,105 @@ def main(args):
     plt.ylabel("Density")
     plt.legend(loc='upper center')
     plt.grid(True, alpha=0.3)
-    
-    out_path = os.path.join(args.out_dir, "bayesian_fusion_hist.png")
-    plt.savefig(out_path, bbox_inches='tight')
-    print(f"Saved plot to {out_path}")
+    out_hist = os.path.join(args.out_dir, "bayesian_fusion_hist.png")
+    plt.savefig(out_hist, bbox_inches='tight')
+    plt.close()
 
-# ==========================================
-    # 额外赠送：散点图 (横纵 1:1 绝对同比例 + 决策边界的几何证明)
     # ==========================================
+    # 准备随机抽样索引 (共用，确保两张散点图点的位置严格一一对应)
+    # ==========================================
+    total_samples = len(Y_np)
+    limit = min(1000, total_samples)
+    np.random.seed(42)
+    random_idx = np.random.choice(total_samples, size=limit, replace=False)
+    Y_sample = Y_np[random_idx]
+    mask0_sample = (Y_sample == 0)
+    mask1_sample = (Y_sample == 1)
+
+    # ==========================================
+    # 7. 图 2: 概率空间散点图 (Probability Space)
+    # ==========================================
+    print("Generating Probability Space Scatter Plot...")
     plt.figure(figsize=(8, 8), dpi=150)
     
-    # 取前 1500 个样本画散点
-    limit = min(1500, len(Y_np))
-    x_val_0 = val_mlp.numpy().flatten()[:limit][mask0[:limit]]
-    y_val_0 = val_gnn.numpy().flatten()[:limit][mask0[:limit]]
-    x_val_1 = val_mlp.numpy().flatten()[:limit][mask1[:limit]]
-    y_val_1 = val_gnn.numpy().flatten()[:limit][mask1[:limit]]
+    P_mlp_sample = P_mlp[random_idx]
+    P_gnn_sample = P_gnn[random_idx]
 
-    plt.scatter(x_val_0, y_val_0, color='blue', alpha=0.5, edgecolor='none', label='True 0 (Unbiased)')
-    plt.scatter(x_val_1, y_val_1, color='orange', alpha=0.5, edgecolor='none', label='True 1 (Biased)')
+    plt.scatter(P_mlp_sample[mask0_sample], P_gnn_sample[mask0_sample], color='blue', alpha=0.5, edgecolor='none', label='True 0 (Fiducial)')
+    plt.scatter(P_mlp_sample[mask1_sample], P_gnn_sample[mask1_sample], color='orange', alpha=0.5, edgecolor='none', label='True 1 (Biased)')
     
-    # 画出原始的 MLP/GNN 零点准星
+    plt.axvline(0.5, color='black', linestyle='-', linewidth=1.2, alpha=0.4)
+    plt.axhline(0.5, color='black', linestyle='-', linewidth=1.2, alpha=0.4)
+    plt.xlim(-0.05, 1.05)
+    plt.ylim(-0.05, 1.05)
+
+    if abs(gamma) > 1e-5:
+        f_grid = np.linspace(-10, 10, 1000) # 缩小网格范围防止平移横线
+        FX, FY = np.meshgrid(f_grid, f_grid)
+        F_FUS = (FX / temp) + (gamma * FY)
+        p_axis = compute_probability(torch.tensor(f_grid)).numpy()
+        plt.contour(p_axis, p_axis, F_FUS, levels=[0.0], colors=['red'], linestyles=['--'], linewidths=[2.5])
+        plt.plot([],[], color='red', linestyle='--', linewidth=2.5, label='Fusion Decision Boundary')
+    else:
+        plt.axvline(0.5, color='red', linestyle='--', linewidth=2.5, label='Decision Boundary (Pure MLP)')
+
+    plt.xlabel(r"MLP Probability $P_{MLP}(M_1 | x)$")
+    plt.ylabel(r"GNN Probability $P_{GNN}(M_1 | x)$")
+    plt.title("Bayesian Fusion in Probability Space")
+    plt.legend(loc='upper left', bbox_to_anchor=(1.05, 1))
+    out_prob_scatter = os.path.join(args.out_dir, "bayesian_geometry_prob_scatter.png")
+    plt.savefig(out_prob_scatter, bbox_inches='tight')
+    plt.close()
+
+    # ==========================================
+    # 8. 图 3: 对数证据空间散点图 (Log-Evidence Space)
+    # ==========================================
+    print("Generating Log-Evidence Space Scatter Plot...")
+    plt.figure(figsize=(8, 8), dpi=150)
+    
+    f_mlp_sample = val_mlp.numpy().flatten()[random_idx]
+    f_gnn_sample = val_gnn.numpy().flatten()[random_idx]
+
+    plt.scatter(f_mlp_sample[mask0_sample], f_gnn_sample[mask0_sample], color='blue', alpha=0.5, edgecolor='none', label='True 0 (Fiducial)')
+    plt.scatter(f_mlp_sample[mask1_sample], f_gnn_sample[mask1_sample], color='orange', alpha=0.5, edgecolor='none', label='True 1 (Biased)')
+    
     plt.axvline(0, color='black', linestyle='-', linewidth=1.2, alpha=0.4)
     plt.axhline(0, color='black', linestyle='-', linewidth=1.2, alpha=0.4)
 
-    # 找到全局的最大最小值，强行画一个正方形的绝对坐标系
-    all_x = np.concatenate([x_val_0, x_val_1])
-    all_y = np.concatenate([y_val_0, y_val_1])
-    global_min = min(all_x.min(), all_y.min()) - 0.5
-    global_max = max(all_x.max(), all_y.max()) + 0.5
-
+    # 强行画一个正方形的绝对坐标系
+    global_min = min(f_mlp_sample.min(), f_gnn_sample.min()) - 0.5
+    global_max = max(f_mlp_sample.max(), f_gnn_sample.max()) + 0.5
     x_line = np.linspace(global_min, global_max, 100)
 
-# ==========================================
-    # 【高能预警】：用数学绘制贝叶斯融合的几何真理 (完美支持负 Gamma！)
-    # ==========================================
-    # 用绝对值判断，防止把负 gamma 漏掉！
     if abs(gamma) > 1e-5:
-        # 1. 融合投影轴 (Fusion Axis)
+        # 【加回来的灵魂】：融合投影轴 (Fusion Axis)，它完美垂直于决策边界！
         m_axis = gamma * temp
-        plt.plot(x_line, m_axis * x_line, color='red', linestyle='-', linewidth=2, alpha=0.8, 
-                 label=f'Fusion Axis (Slope: {m_axis:.3f})')
+        y_axis = m_axis * x_line
+        mask_axis = (y_axis >= global_min) & (y_axis <= global_max)
+        plt.plot(x_line[mask_axis], y_axis[mask_axis], color='red', linestyle='-', linewidth=2, alpha=0.8, label=f'Fusion Axis (Slope: {m_axis:.3f})')
         
-        # 2. 决策边界 (Decision Boundary): 垂直于投影轴的零点分割线
+        # 决策边界 (Decision Boundary): 垂直于投影轴的零点分割线
         m_bound = -1.0 / (gamma * temp)
-        
-        # 掩码控制，防止斜线画出正方形画布，导致坐标系被暴力拉扯变形
         y_bound = m_bound * x_line
         mask_bound = (y_bound >= global_min) & (y_bound <= global_max)
-        
-        plt.plot(x_line[mask_bound], y_bound[mask_bound], color='red', linestyle='--', linewidth=2.5, 
-                 label=f'Decision Boundary ($f_{{fus}}=0$)')
+        plt.plot(x_line[mask_bound], y_bound[mask_bound], color='red', linestyle='--', linewidth=2.5, label=f'Decision Boundary ($f_{{fus}}=0$)')
     else:
-        # 只有在 Gamma 严格为 0 时，才退化为纯 MLP
         plt.axvline(0, color='red', linestyle='--', linewidth=2.5, label='Decision Boundary (Pure MLP)')
-
-    # 强制让 X 轴和 Y 轴的视野完全一样，避免视觉拉伸！
     plt.xlim(global_min, global_max)
-    plt.ylim(global_min, global_max)
-    plt.gca().set_aspect('equal', adjustable='box')
+    #plt.ylim(global_min, global_max)
+    plt.ylim(-2, 4)
+    #plt.gca().set_aspect('equal', adjustable='box')
 
     plt.xlabel(r"MLP Log-Evidence $f_{MLP}$")
     plt.ylabel(r"GNN Log-Evidence $f_{GNN}$")
-    plt.title("Orthogonality Check: Bayesian Fusion Geometry\n(1:1 True Physical Scale)")
-    
-    # 将图例放在外面防止遮挡散点
+    plt.title("Orthogonality Check: Log-Evidence Space (1:1 Scale)")
     plt.legend(loc='upper left', bbox_to_anchor=(1.05, 1))
     
-    out_scatter = os.path.join(args.out_dir, "bayesian_geometry_scatter.png")
-    plt.savefig(out_scatter, bbox_inches='tight')
-    print(f"Saved Bayesian Geometry plot to {out_scatter}")
+    out_log_scatter = os.path.join(args.out_dir, "bayesian_geometry_log_scatter.png")
+    plt.savefig(out_log_scatter, bbox_inches='tight')
+    plt.close()
+    
+    print("All plots generated successfully!")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

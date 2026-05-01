@@ -22,7 +22,7 @@ export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 echo "================================================================"
 echo ">>> [Phase 1] Synced Evidence Extraction (100% Alignment)..."
 python scripts/10_extract_sync.py \
-        --subbox_size 50.0 \
+        --subbox_size 60.0 \
         --num_subboxes 8
 
 echo "================================================================"

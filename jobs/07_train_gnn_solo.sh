@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
 #SBATCH --gpus-per-node=1
-#SBATCH --time=03:00:00               
+#SBATCH --time=04:00:00               
 #SBATCH --partition=ghx4
 #SBATCH --account=bdne-dtai-gh
 #SBATCH --output=/work/hdd/bdne/jdong8/jobout/%x_%j.out
@@ -42,9 +42,10 @@ python scripts/9_train_gnn.py \
     --vector_dir "$DATA_BASE/vectors" \
     --catalog_dir "$DATA_BASE/catalogs" \
     --out_dir "/work/hdd/bdne/jdong8/fusion_models/gnn_solo" \
-    --epochs 40 \
-    --batch_size 256 \
+    --epochs 60 \
+    --batch_size 128 \
     --num_subboxes 8 \
+    --r_link 20.0 \
     --lr 5e-4 
 
 echo "================================================================"
