@@ -49,9 +49,10 @@ def l_pop_transform(x, alpha=2.0):
 
 def one_pop_exponential_loss(f_x, targets, alpha=2.0, c=0.0):
     J_val = l_pop_transform(f_x, alpha)
-    # 【物理真理】：J_val 是纯证据，必须加上先验 c 才能拼成后验，送去算 Loss
     term = (0.5 - targets) * (J_val + c)
-    term = torch.clamp(term, min=-20.0, max=20.0)
+    # [CRITICAL ARMOR] Prevent Gradient Hijacking by an isolated outlier.
+    # max=7.0 bounds the maximum single-sample penalty to e^7 ≈ 1096.
+    term = torch.clamp(term, min=-20.0, max=7.0)
     loss = torch.exp(term)
     return torch.mean(loss)
 
@@ -73,6 +74,9 @@ class VectorDataset(Dataset):
             
         self.y = payload['labels']
         self.x = self.x.float()
+        # [CRITICAL ARMOR] Clamp input features to 10-sigma.
+        # Eradicates shot-noise outliers from the lightcone summary statistics.
+        self.x = torch.clamp(self.x, min=-10.0, max=10.0)
         self.y = self.y.float().view(-1, 1)
         
         if self.x.shape[0] < self.x.shape[1] and self.x.shape[0] <= 2000:

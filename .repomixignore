@@ -1,0 +1,17 @@
+# 忽略数据和模型等大文件
+data/
+fusion_data/
+fusion_models/
+models/
+logs/
+jobout/
+*.pt
+*.h5
+*.npy
+*.png
+*.pdf
+
+# 忽略隐藏文件夹和环境
+.git/
+__pycache__/
+*.pyc

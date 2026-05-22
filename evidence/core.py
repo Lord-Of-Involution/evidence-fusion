@@ -36,7 +36,7 @@ def one_pop_exponential_loss(f_x, targets, alpha=2.0, c=0.0):
     # Prevents exp(88) -> inf -> NaN. 
     # This is a numerical stability fix. Clamping at +/- 20 is safe
     # because e^20 is huge enough to drive gradients effectively.
-    term = torch.clamp(term, min=-20.0, max=10.0)
+    term = torch.clamp(term, min=-20.0, max=7.0)
     
     loss = torch.exp(term)
     return torch.mean(loss)

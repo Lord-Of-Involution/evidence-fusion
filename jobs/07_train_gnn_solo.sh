@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=gnn_solo_gh200
+#SBATCH --job-name=gnn_solo_abacus
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
@@ -27,26 +27,30 @@ export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 nvidia-smi
 
 echo "================================================================"
-echo "Starting Anisotropic GNN Solo Training on $(hostname)"
+echo "Starting Anisotropic GNN Solo Training on $(hostname) [ABACUS LIGHTCONE]"
 echo "Date: $(date)"
 echo "================================================================"
 
-DATA_BASE="/work/hdd/bdne/jdong8/fusion_data"
+# [CRITICAL] 指向全新生成的光锥数据集
+DATA_BASE="/work/hdd/bdne/jdong8/fusion_data_abacus"
+
 if [ ! -f "$DATA_BASE/catalogs/train_centers.pt" ]; then
-    echo "[FATAL ERROR] 找不到脱壳预计算文件: train_centers.pt"
+    echo "[FATAL ERROR] 找不到脱壳预计算文件: $DATA_BASE/catalogs/train_centers.pt"
     exit 1
 fi
 
-# 【加回来了！】明确指定 --num_subboxes 4
+# [CRITICAL] 注入光锥拓扑开关与新的输出路径
 python scripts/9_train_gnn.py \
     --vector_dir "$DATA_BASE/vectors" \
     --catalog_dir "$DATA_BASE/catalogs" \
-    --out_dir "/work/hdd/bdne/jdong8/fusion_models/gnn_solo" \
-    --epochs 60 \
+    --out_dir "/work/hdd/bdne/jdong8/fusion_models/abacus_gnn_solo" \
+    --bce_epochs 40 \
+    --epochs 120 \
     --batch_size 128 \
-    --num_subboxes 8 \
+    --num_subboxes 4 \
     --r_link 20.0 \
-    --lr 5e-4 
+    --lr 1e-3 \
+    --geometry "lightcone" 
 
 echo "================================================================"
 echo ">>> Training flawlessly completed."

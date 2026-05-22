@@ -4,7 +4,7 @@ import numpy as np
 from torch_geometric.data import Data, Dataset
 
 class QuijotePointCloudDataset(Dataset):
-    def __init__(self, vector_pt_path, catalog_h5_path, centers_pt_path, subbox_size=60.0, num_subboxes=8):
+    def __init__(self, vector_pt_path, catalog_h5_path, centers_pt_path, subbox_size=60.0, num_subboxes=8, max_nodes_per_box=800):
         super().__init__()
         payload = torch.load(vector_pt_path, map_location='cpu', weights_only=False)
         self.labels = payload['labels']
@@ -13,61 +13,65 @@ class QuijotePointCloudDataset(Dataset):
         self.h5_file_path = catalog_h5_path
         self.subbox_size = subbox_size
         self.M = num_subboxes 
+        self.max_nodes = max_nodes_per_box  
         
-        # 读入所有中心点
         all_centers = torch.load(centers_pt_path, map_location='cpu', weights_only=False)
         
-        # 【护城河】：检查预计算的框够不够
         if all_centers.shape[1] < self.M:
-            raise ValueError(f"[FATAL] 预计算的中心点只有 {all_centers.shape[1]} 个，但你请求了 {self.M} 个！请重新跑 2.5 脚本。")
+            raise ValueError(f"[FATAL] Precomputed centers ({all_centers.shape[1]}) < requested ({self.M}).")
             
-        # 动态截取前 M 个，极其灵活！
         self.centers = all_centers[:, :self.M, :]
-        
         self.h5_handle = None 
 
     def len(self):
         return len(self.labels)
 
     def get(self, idx):
-        if self.h5_handle is None:
-            self.h5_handle = h5py.File(self.h5_file_path, 'r', swmr=True)
+            # [ABSOLUTE THREAD SAFETY]
+            # Never hold a persistent HDF5 handle across PyTorch workers on Lustre.
+            # Open, extract to RAM, and close immediately to bypass HDF5 C-level futex deadlocks.
+            try:
+                with h5py.File(self.h5_file_path, 'r') as h5_handle:
+                    grp = h5_handle[str(idx)]
+                    
+                    label = self.labels[idx]
+                    vec = self.vectors[idx]
+                    centers = self.centers[idx].numpy()
 
-        try:
-            pos_rsd = self.h5_handle[str(idx)]['pos_rsd'][:]
-        except (KeyError, OSError):
-            return self.get(np.random.randint(1, self.len()))
+                    all_pos = []
+                    all_x = []
+                    all_sub_batch = []
+                    all_los = [] 
 
-        label = self.labels[idx]
-        vec = self.vectors[idx]
+                    for m_idx, c in enumerate(centers):
+                        try:
+                            sub_pos = grp[f"sub_{m_idx}"][:]
+                        except KeyError:
+                            sub_pos = np.array([c, c + 1e-3, c - 1e-3], dtype=np.float32)
 
-        # 极速获取中心点
-        centers = self.centers[idx].numpy()
+                        num_gals = len(sub_pos)
+                        if num_gals > self.max_nodes:
+                            keep_idx = np.random.choice(num_gals, self.max_nodes, replace=False)
+                            sub_pos = sub_pos[keep_idx]
 
-        all_pos =[]
-        all_x = []
-        all_sub_batch =[]
+                        # Absolute Line-of-Sight vector
+                        los_vec = c / (np.linalg.norm(c) + 1e-8)
+                        # Center the subbox
+                        sub_pos = sub_pos - c
+                        
+                        all_pos.append(torch.tensor(sub_pos, dtype=torch.float32))
+                        all_x.append(torch.ones((len(sub_pos), 1), dtype=torch.float32))
+                        all_sub_batch.append(torch.full((len(sub_pos),), m_idx, dtype=torch.long))
+                        all_los.append(torch.tensor(los_vec, dtype=torch.float32).repeat(len(sub_pos), 1))
 
-        for m_idx, c in enumerate(centers):
-            start = c - (self.subbox_size / 2.0)
+            except (KeyError, OSError):
+                # Fallback for filesystem fragmentation or missing keys
+                return self.get(np.random.randint(0, self.len()))
+
+            # Assemble the final PyG Data object completely in RAM
+            pos_tensor = torch.cat(all_pos, dim=0)
+            x_tensor = torch.cat(all_x, dim=0)
+            sub_batch_tensor = torch.cat(all_sub_batch, dim=0)
+            los_tensor = torch.cat(all_los, dim=0)
             
-            shifted_pos = (pos_rsd - start) % 1000.0
-            mask = (shifted_pos[:, 0] <= self.subbox_size) & \
-                   (shifted_pos[:, 1] <= self.subbox_size) & \
-                   (shifted_pos[:, 2] <= self.subbox_size)
-            sub_pos = shifted_pos[mask]
-            
-            if len(sub_pos) < 3:
-                sub_pos = np.array([[0.0, 0.0, 0.0],[1.0, 1.0, 1.0]], dtype=np.float32)
-            
-            sub_pos = sub_pos - (self.subbox_size / 2.0)
-            
-            all_pos.append(torch.tensor(sub_pos, dtype=torch.float32))
-            all_x.append(torch.ones((len(sub_pos), 1), dtype=torch.float32))
-            all_sub_batch.append(torch.full((len(sub_pos),), m_idx, dtype=torch.long))
-
-        pos_tensor = torch.cat(all_pos, dim=0)
-        x_tensor = torch.cat(all_x, dim=0)
-        sub_batch_tensor = torch.cat(all_sub_batch, dim=0)
-        
-        return Data(x=x_tensor, pos=pos_tensor, y=label, vec=vec, sub_batch=sub_batch_tensor)
+            return Data(x=x_tensor, pos=pos_tensor, y=label, vec=vec, sub_batch=sub_batch_tensor, los=los_tensor)
