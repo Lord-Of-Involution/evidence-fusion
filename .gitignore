@@ -11,5 +11,5 @@ runs/
 experiments/
 models/
 figures/
-analysis/
+plots/
 *.pt
