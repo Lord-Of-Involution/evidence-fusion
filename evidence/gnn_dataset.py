@@ -27,9 +27,6 @@ class QuijotePointCloudDataset(Dataset):
         return len(self.labels)
 
     def get(self, idx):
-            # [ABSOLUTE THREAD SAFETY]
-            # Never hold a persistent HDF5 handle across PyTorch workers on Lustre.
-            # Open, extract to RAM, and close immediately to bypass HDF5 C-level futex deadlocks.
             try:
                 with h5py.File(self.h5_file_path, 'r') as h5_handle:
                     grp = h5_handle[str(idx)]
@@ -49,15 +46,20 @@ class QuijotePointCloudDataset(Dataset):
                         except KeyError:
                             sub_pos = np.array([c, c + 1e-3, c - 1e-3], dtype=np.float32)
 
+                        # Center the subbox immediately for accurate distance metrics
+                        sub_pos = sub_pos - c
                         num_gals = len(sub_pos)
+                        
                         if num_gals > self.max_nodes:
-                            keep_idx = np.random.choice(num_gals, self.max_nodes, replace=False)
+                            # [CRITICAL FIX: TOPOLOGICAL INTEGRITY]
+                            # Stop destroying the metric space with random dropout.
+                            # Sort by distance to the origin (center) and keep the dense core.
+                            dists = np.linalg.norm(sub_pos, axis=1)
+                            keep_idx = np.argsort(dists)[:self.max_nodes]
                             sub_pos = sub_pos[keep_idx]
 
-                        # Absolute Line-of-Sight vector
+                        # Absolute Line-of-Sight vector pointing to the subbox center
                         los_vec = c / (np.linalg.norm(c) + 1e-8)
-                        # Center the subbox
-                        sub_pos = sub_pos - c
                         
                         all_pos.append(torch.tensor(sub_pos, dtype=torch.float32))
                         all_x.append(torch.ones((len(sub_pos), 1), dtype=torch.float32))
@@ -65,10 +67,8 @@ class QuijotePointCloudDataset(Dataset):
                         all_los.append(torch.tensor(los_vec, dtype=torch.float32).repeat(len(sub_pos), 1))
 
             except (KeyError, OSError):
-                # Fallback for filesystem fragmentation or missing keys
                 return self.get(np.random.randint(0, self.len()))
 
-            # Assemble the final PyG Data object completely in RAM
             pos_tensor = torch.cat(all_pos, dim=0)
             x_tensor = torch.cat(all_x, dim=0)
             sub_batch_tensor = torch.cat(all_sub_batch, dim=0)

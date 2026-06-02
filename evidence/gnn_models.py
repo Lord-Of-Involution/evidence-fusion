@@ -1,35 +1,11 @@
 import torch
 import torch.nn as nn
-from torch_geometric.nn import MessagePassing, global_mean_pool, global_max_pool
-
-@torch.no_grad()
-def native_radius_graph(pos, r, global_batch):
-    edge_indices = []
-    unique_batches = torch.unique(global_batch)
-    
-    for b_idx in unique_batches:
-        node_indices = torch.where(global_batch == b_idx)[0]
-        pos_b = pos[node_indices]
-        
-        dist_mat = torch.cdist(pos_b, pos_b)
-        mask = (dist_mat <= r) & (dist_mat > 1e-5)
-        row_local, col_local = torch.where(mask)
-        
-        row_global = node_indices[row_local]
-        col_global = node_indices[col_local]
-        
-        edge_indices.append(torch.stack([row_global, col_global], dim=0))
-        
-    if len(edge_indices) == 0:
-        return torch.empty((2, 0), dtype=torch.long, device=pos.device)
-        
-    return torch.cat(edge_indices, dim=1)
-
+from torch_geometric.nn import MessagePassing, global_mean_pool, global_max_pool, radius_graph
 
 class AnisotropicGNN(MessagePassing):
     def __init__(self, in_channels, out_channels, r_link=20.0, geometry="lightcone"):
-        # [ULTIMATE PHYSICS UPGRADE: Shape, Dispersion, and Explicit Density]
-        super().__init__(aggr=['mean', 'std']) 
+        # CRITICAL FIX: 'sum' is mandatory to preserve absolute local density (delta).
+        super().__init__(aggr=['mean', 'std', 'sum']) 
         assert geometry in ["plane_parallel", "lightcone"], "FATAL: Invalid geometry mode"
         
         self.r_link = r_link
@@ -38,30 +14,30 @@ class AnisotropicGNN(MessagePassing):
         
         self.edge_mlp = nn.Sequential(
             nn.Linear(in_channels + 5, 32),
+            nn.LayerNorm(32),
             nn.GELU(),
             nn.Linear(32, self.edge_out_dim)
         )
         
-        # Aggr out: 32 (mean) + 32 (std) + 1 (log-degree/local density) = 65
-        aggr_dim = (self.edge_out_dim * 2) + 1
+        # 3 aggregators (mean, std, sum) * edge_out_dim
+        aggr_dim = (self.edge_out_dim * 3) 
         
         self.node_mlp = nn.Sequential(
             nn.Linear(in_channels + aggr_dim, out_channels),
-            nn.BatchNorm1d(out_channels), 
+            nn.LayerNorm(out_channels), 
             nn.GELU(),
             nn.Linear(out_channels, out_channels)
         )
 
     def forward(self, x, pos, global_batch, los=None):
-        edge_index = native_radius_graph(pos, r=self.r_link, global_batch=global_batch)
+        edge_index = radius_graph(
+            pos, 
+            r=self.r_link, 
+            batch=global_batch, 
+            max_num_neighbors=64,
+            loop=False
+        )
         row, col = edge_index
-        
-        # [CRITICAL ARMOR: Decoupled Density]
-        # Calculate explicit local degree for each receiver node.
-        # minlength ensures the tensor matches the exact number of nodes even if some are isolated.
-        deg = torch.bincount(row, minlength=pos.size(0)).view(-1, 1).float()
-        # Log-compression tames [0, 800] into a safe neural scale [0, 6.6]
-        deg_norm = torch.log1p(deg)
         
         pos_row = pos[row] 
         pos_col = pos[col] 
@@ -91,23 +67,18 @@ class AnisotropicGNN(MessagePassing):
         
         edge_attr = torch.stack([z_scaled, para_scaled, perp_scaled, cos_theta, norm_scaled], dim=1)
         
-        # Pass deg_norm through the propagate mechanism to reach the update function
-        x = self.propagate(edge_index, x=x, edge_attr=edge_attr, deg_norm=deg_norm, size=(x.size(0), x.size(0)))
+        x = self.propagate(edge_index, x=x, edge_attr=edge_attr)
         return x
 
     def message(self, x_j, edge_attr):
         combined = torch.cat([x_j, edge_attr], dim=-1)
         raw_message = self.edge_mlp(combined)
         
-        # Spatial envelope enforcing gravity's inductive bias
         spatial_envelope = torch.exp(-3.0 * edge_attr[:, 4]).unsqueeze(1)
-        
         return raw_message * spatial_envelope
 
-    def update(self, aggr_out, x, deg_norm):
-        # aggr_out: [N, 64] | deg_norm: [N, 1]
-        # The node explicitly "sees" its decoupled absolute density alongside its spatial shape!
-        combined = torch.cat([x, aggr_out, deg_norm], dim=1)
+    def update(self, aggr_out, x):
+        combined = torch.cat([x, aggr_out], dim=1)
         out = self.node_mlp(combined)
         
         if x.size(1) == out.size(1):
@@ -115,30 +86,35 @@ class AnisotropicGNN(MessagePassing):
             
         return out
 
-
-class EvidenceGNN(nn.Module):
+class MicroTopologyGNN(nn.Module):
+    """
+    PURE GNN BASELINE:
+    Stripped of all macroscopic vector logic. 
+    Outputs a highly non-linear feature manifold of the microscopic universe.
+    """
     def __init__(self, r_link=20.0, hidden_dim=64, geometry="lightcone"):
         super().__init__()
         self.conv1 = AnisotropicGNN(in_channels=1, out_channels=hidden_dim, r_link=r_link, geometry=geometry)
         self.conv2 = AnisotropicGNN(in_channels=hidden_dim, out_channels=hidden_dim, r_link=r_link, geometry=geometry)
         
-        self.head = nn.Sequential(
-            nn.Linear(hidden_dim * 4, 128),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, 64),
-            nn.GELU(),
-            nn.Linear(64, 1) 
-        )
+        # 4 pooling features (mean, max, min, var)
+        self.gnn_feat_dim = hidden_dim * 4 
+        base_dim = self.gnn_feat_dim * 2 # concat mean and max of subboxes
         
-        self.mil_temp = nn.Parameter(torch.tensor(1.0))
+        self.output_dim = 128
+        
+        self.micro_encoder = nn.Sequential(
+            nn.Linear(base_dim, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, self.output_dim)
+        )
 
-    def forward(self, data):
-        x, pos, batch, sub_batch = data.x, data.pos, data.batch, data.sub_batch
+    def forward(self, x, pos, batch, sub_batch, los=None):
+        B = batch.max().item() + 1
         M = sub_batch.max().item() + 1
         global_batch = batch * M + sub_batch
-        
-        los = getattr(data, 'los', None)
         
         x = self.conv1(x, pos, global_batch, los=los)
         x = self.conv2(x, pos, global_batch, los=los)
@@ -146,15 +122,14 @@ class EvidenceGNN(nn.Module):
         x_mean = global_mean_pool(x, global_batch)
         x_max = global_max_pool(x, global_batch)
         x_min = -global_max_pool(-x, global_batch)
+        
         x_sq_mean = global_mean_pool(x**2, global_batch)
         x_var = torch.relu(x_sq_mean - x_mean**2) 
         
-        global_feat = torch.cat([x_mean, x_max, x_min, x_var], dim=1)
+        subbox_feat = torch.cat([x_mean, x_max, x_min, x_var], dim=1)
+        subbox_feat = subbox_feat.view(B, M, -1)
+        cone_mean = subbox_feat.mean(dim=1)     
+        cone_max = subbox_feat.max(dim=1)[0]    
         
-        local_evidences = self.head(global_feat)
-        local_evidences = local_evidences.view(batch.max().item() + 1, M)
-        
-        safe_temp = torch.clamp(self.mil_temp, min=0.1)
-        global_evidence = local_evidences.mean(dim=1, keepdim=True) / safe_temp
-        
-        return global_evidence
+        micro_raw = torch.cat([cone_mean, cone_max], dim=1)
+        return self.micro_encoder(micro_raw)

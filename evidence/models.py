@@ -97,62 +97,19 @@ class EvidenceMLP(nn.Module):
             J_val = l_pop_transform(f_x, alpha)
             return torch.sigmoid(J_val)
 
-# ==============================================================================
-# 2. The 3D CNN (ResNet-10 Feature Extractor)
-# ==============================================================================
-class Small3DCNN(nn.Module):
+
+
+class EarlyFusionNetwork(nn.Module):
     """
-    ResNet-10 (3D) for Voxel Grids.
+    RIGOROUS EARLY FUSION:
+    Takes an explicitly instantiated EvidenceMLP and MicroTopologyGNN.
+    Concatenates their representation manifolds, and maps to J-Space.
     """
-    def __init__(self, input_channels=1, feature_dim=128):
+    def __init__(self, mlp_backbone, gnn_backbone, freeze_mlp=False):
         super().__init__()
         
-        self.stem = nn.Sequential(
-            nn.InstanceNorm3d(input_channels, affine=True),
-            nn.Conv3d(input_channels, 64, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm3d(64),
-            nn.GELU()
-        )
-        
-        self.layer1 = ResidualBlock(64, 64, stride=2, is_3d=True)
-        self.layer2 = ResidualBlock(64, 128, stride=2, is_3d=True)
-        self.layer3 = ResidualBlock(128, 256, stride=2, is_3d=True)
-        self.layer4 = ResidualBlock(256, 512, stride=2, is_3d=True)
-        
-        self.pool = nn.AdaptiveAvgPool3d((1, 1, 1))
-        
-        self.projection = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(512, feature_dim),
-            nn.GELU(),
-            nn.BatchNorm1d(feature_dim)
-        )
-
-        self.output_dim = feature_dim 
-
-    def forward(self, x):
-        x = self.stem(x)
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
-        x = self.pool(x)
-        return self.projection(x)
-
-# ==============================================================================
-# 3. The Fusion Network (Linear Shortcut + Deep Residual)
-# ==============================================================================
-class FusionEvidenceNetwork(nn.Module):
-    """
-    Combines Pre-trained MLP and CNN using 'Linear Shortcut' + 'Deep Residual' strategy.
-    
-    1. Shortcut: Copies MLP weights exactly. Ensures Initial Acc = MLP Acc.
-    2. Residual: A deep ResNet that learns to correct the MLP using CNN data.
-    """
-    def __init__(self, mlp_model, cnn_model, freeze_mlp=True):
-        super().__init__()
-        self.mlp = mlp_model
-        self.cnn = cnn_model
+        self.mlp = mlp_backbone
+        self.gnn = gnn_backbone
         
         if freeze_mlp:
             for param in self.mlp.parameters():
@@ -160,58 +117,49 @@ class FusionEvidenceNetwork(nn.Module):
             self.mlp.eval()
             
         mlp_dim = self.mlp.output_dim
-        cnn_dim = self.cnn.output_dim
-        fusion_dim = mlp_dim + cnn_dim
+        gnn_dim = self.gnn.output_dim
+        fusion_dim = mlp_dim + gnn_dim
 
-        # --- A. Linear Shortcut (The "Smart Init" Path) ---
-        # Mimics the original MLP head exactly.
-        # f_shortcut(mlp_feat) = f_mlp(raw_input)
-        self.mlp_shortcut = nn.Linear(mlp_dim, 1)
-
-        # --- B. Deep Residual Head (The "Correction" Path) ---
-        # Takes [MLP_Features, CNN_Features] and learns a correction term.
-        # Initialized to output 0.
-        self.fusion_residual = nn.Sequential(
-            nn.BatchNorm1d(fusion_dim),
+        # ORTHOGONAL FUSION HEAD
+        self.fusion_head = nn.Sequential(
             nn.Linear(fusion_dim, 256),
+            nn.BatchNorm1d(256),  # Kept consistent with MLP logic
             nn.GELU(),
-            # 1D Residual Block for non-linear fusion
-            ResidualBlock(256, 256, is_3d=False), 
-            nn.Dropout(0.2),
-            nn.Linear(256, 1)
+            nn.Dropout(0.3),
+            nn.Linear(256, 64),
+            nn.BatchNorm1d(64),
+            nn.GELU(),
+            nn.Linear(64, 1)
         )
+        
+        self.mil_temp = nn.Parameter(torch.tensor(1.0))
 
-        self._smart_init()
-
-    def _smart_init(self):
-        """
-        Initialize weights to guarantee:
-        Output = MLP_Prediction + 0
-        """
-        with torch.no_grad():
-            # 1. Copy MLP Head weights to Shortcut
-            # Note: We use self.mlp.head because we restored your MLP class structure
-            self.mlp_shortcut.weight.copy_(self.mlp.head.weight)
-            self.mlp_shortcut.bias.copy_(self.mlp.head.bias)
-            
-            # 2. Zero-init the Residual Head (Last layer only)
-            self.fusion_residual[-1].weight.fill_(0.0)
-            self.fusion_residual[-1].bias.fill_(0.0)
-
-    def forward(self, x_grid, x_vectors):
-            # 1. Get MLP Features (Thread-safe)
+    def forward(self, data):
+        # 1. Micro-Topology Extraction
+        feat_gnn = self.gnn(
+            x=data.x, 
+            pos=data.pos, 
+            batch=data.batch, 
+            sub_batch=data.sub_batch, 
+            los=getattr(data, 'los', None)
+        )
+        
+        # 2. Macro-Spectra Extraction
+        # data.vec must be reshaped to match batch size B
+        B = data.batch.max().item() + 1
+        macro_vec = data.vec.view(B, -1)
+        
+        if not self.mlp.training:
             with torch.no_grad():
-                feat_mlp = self.mlp(x_vectors, return_features=True)
+                feat_mlp = self.mlp(macro_vec, return_features=True)
+        else:
+            feat_mlp = self.mlp(macro_vec, return_features=True)
             
-            # 2. Get CNN Features
-            feat_cnn = self.cnn(x_grid)
-            
-            # 3. Path A: Base Prediction (Teacher)
-            base_pred = self.mlp_shortcut(feat_mlp)
-            
-            # 4. Path B: Residual Correction (Deep Fusion)
-            combined = torch.cat([feat_mlp, feat_cnn], dim=1)
-            correction = self.fusion_residual(combined)
-            
-            # ✅ 正确写法：
-            return base_pred + correction
+        # 3. Fusion Representation
+        combined_feat = torch.cat([feat_gnn, feat_mlp], dim=1)
+        
+        # 4. Map to Evidence
+        global_evidence = self.fusion_head(combined_feat)
+        
+        safe_temp = torch.clamp(self.mil_temp, min=0.1)
+        return global_evidence / safe_temp
